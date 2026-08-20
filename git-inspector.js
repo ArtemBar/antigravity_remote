@@ -59,6 +59,17 @@ function decodeGitOctalOnly(str) {
   });
 }
 
+function matchRepo(hint, repos) {
+  if (!hint || !repos || repos.length === 0) return repos[0]?.path || '';
+  const lowerHint = decodeURIComponent(hint).toLowerCase();
+  for (const r of repos) {
+    if (lowerHint.includes(r.path.toLowerCase()) || lowerHint.includes(r.name.toLowerCase())) {
+      return r.path;
+    }
+  }
+  return repos[0]?.path || '';
+}
+
 // -------------------------------------------------------------
 // 2. Git API Endpoints
 // -------------------------------------------------------------
@@ -134,9 +145,10 @@ function handleGitApi(req, res, url) {
 // -------------------------------------------------------------
 // 3. Standalone Git Inspector HTML Web UI (Server-Rendered First Frame)
 // -------------------------------------------------------------
-function renderGitUi(res) {
+function renderGitUi(res, url) {
   const repos = findGitRepos();
-  const currentRepo = repos[0]?.path || '';
+  const activeHint = (url && url.searchParams) ? (url.searchParams.get('active') || '') : '';
+  const currentRepo = matchRepo(activeHint, repos);
   let initialBranch = 'main';
   let initialFiles = [];
 
@@ -152,7 +164,10 @@ function renderGitUi(res) {
     });
   }
 
-  const repoOptions = repos.map(r => `<option value="${escapeHtmlAttr(r.path)}">${escapeHtmlText(r.name)}</option>`).join('');
+  const repoOptions = repos.map(r => {
+    const isSelected = r.path === currentRepo ? ' selected' : '';
+    return `<option value="${escapeHtmlAttr(r.path)}"${isSelected}>${escapeHtmlText(r.name)}</option>`;
+  }).join('');
 
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(`<!DOCTYPE html>
@@ -420,7 +435,7 @@ function renderGitUi(res) {
   <script>
     var initialRepos = ${JSON.stringify(repos)};
     var initialFiles = ${JSON.stringify(initialFiles)};
-    var currentRepo = initialRepos.length > 0 ? initialRepos[0].path : '';
+    var currentRepo = ${JSON.stringify(currentRepo)};
     var currentTab = 'working';
     var selectedItem = null;
 
@@ -481,6 +496,95 @@ function renderGitUi(res) {
         loadCommitHistory();
       }
     }
+
+    function findActiveRepoFromParent() {
+      try {
+        if (!window.parent || !window.parent.document) return null;
+        var pWin = window.parent;
+        var pDoc = pWin.document;
+
+        // 1. Check parent window URL
+        var pUrl = decodeURIComponent(pWin.location.href || '').toLowerCase();
+        for (var i = 0; i < initialRepos.length; i++) {
+          var r = initialRepos[i];
+          if (pUrl.includes(r.path.toLowerCase()) || pUrl.includes('/' + r.name.toLowerCase() + '/') || pUrl.includes('/' + r.name.toLowerCase() + '?') || pUrl.includes('=' + r.name.toLowerCase())) {
+            return r.path;
+          }
+        }
+
+        // 2. Check parent document title
+        var pTitle = (pDoc.title || '').toLowerCase();
+        for (var i = 0; i < initialRepos.length; i++) {
+          var r = initialRepos[i];
+          if (pTitle.includes(r.name.toLowerCase())) {
+            return r.path;
+          }
+        }
+
+        // 3. Check workspace titles, breadcrumbs, tabs, or headers
+        var selectors = [
+          '.monaco-workbench .part.titlebar',
+          '.monaco-workbench .breadcrumbs-control',
+          '.monaco-workbench .tabs-and-actions-container',
+          '.workspace-title',
+          '.project-title',
+          'header',
+          '[data-workspace-path]',
+          '[role="tab"]'
+        ];
+        for (var s = 0; s < selectors.length; s++) {
+          var els = pDoc.querySelectorAll(selectors[s]);
+          for (var k = 0; k < els.length; k++) {
+            var elText = (els[k].innerText || els[k].getAttribute('aria-label') || '').toLowerCase();
+            for (var i = 0; i < initialRepos.length; i++) {
+              var r = initialRepos[i];
+              if (elText.includes(r.name.toLowerCase())) {
+                return r.path;
+              }
+            }
+          }
+        }
+
+        // 4. Check visible document body text
+        var bodyText = (pDoc.body ? pDoc.body.innerText.substring(0, 20000) : '').toLowerCase();
+        for (var i = 0; i < initialRepos.length; i++) {
+          var r = initialRepos[i];
+          if (bodyText.includes(r.name.toLowerCase())) {
+            return r.path;
+          }
+        }
+      } catch (err) {
+        console.warn('Could not inspect parent DOM:', err);
+      }
+      return null;
+    }
+
+    function autoSelectProject(hint) {
+      if (!hint || !initialRepos || initialRepos.length === 0) return;
+      var lower = decodeURIComponent(hint).toLowerCase();
+      var matched = null;
+      for (var i = 0; i < initialRepos.length; i++) {
+        var r = initialRepos[i];
+        if (lower.includes(r.path.toLowerCase()) || lower.includes(r.name.toLowerCase())) {
+          matched = r.path;
+          break;
+        }
+      }
+      if (matched && matched !== currentRepo) {
+        currentRepo = matched;
+        var sel = document.getElementById('repoSelect');
+        if (sel) sel.value = matched;
+        selectedItem = null;
+        document.body.classList.remove('viewing-diff');
+        loadCurrentView();
+      }
+    }
+
+    window.addEventListener('message', function(e) {
+      if (e.data && e.data.type === 'AUTO_SELECT_PROJECT' && e.data.project) {
+        autoSelectProject(e.data.project);
+      }
+    });
 
     function renderFilesList(files) {
       var sidebar = document.getElementById('sidebarList');
@@ -800,8 +904,14 @@ function renderGitUi(res) {
       };
     }
 
-    // Initial load
-    if (initialFiles && initialFiles.length > 0) {
+    // Auto-detect from parent DOM on load
+    var detectedRepo = findActiveRepoFromParent();
+    if (detectedRepo && detectedRepo !== currentRepo) {
+      currentRepo = detectedRepo;
+      if (sel) sel.value = detectedRepo;
+      selectedItem = null;
+      loadCurrentView();
+    } else if (initialFiles && initialFiles.length > 0) {
       renderFilesList(initialFiles);
     } else {
       loadCurrentView();
@@ -870,8 +980,13 @@ function getInjectedDrawerSnippet() {
         drawer.style.width = window.innerWidth <= 768 ? '100vw' : defaultWidth;
         drawer.style.right = '0px';
         overlay.style.display = 'block';
+
         if (iframe && iframe.contentWindow) {
-          try { iframe.contentWindow.location.reload(); } catch(err) {}
+          try {
+            iframe.contentWindow.location.reload();
+          } catch(err) {
+            iframe.src = '/__git';
+          }
         }
       }
     };
@@ -1009,6 +1124,7 @@ module.exports = {
   findGitRepos,
   executeGit,
   decodeGitOctalOnly,
+  matchRepo,
   handleGitApi,
   renderGitUi,
   getInjectedDrawerSnippet

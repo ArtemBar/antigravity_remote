@@ -58,10 +58,10 @@ test('4. Upstream Header Translation (prepareUpstreamHeaders)', () => {
   const incoming = {
     ':method': 'GET',
     ':path': '/chat',
-    ':authority': 'my-antigravity.astrolabys.com',
-    'host': 'my-antigravity.astrolabys.com',
-    'origin': 'https://my-antigravity.astrolabys.com',
-    'referer': 'https://my-antigravity.astrolabys.com/session/123',
+    ':authority': 'my-remote-app.example.com',
+    'host': 'my-remote-app.example.com',
+    'origin': 'https://my-remote-app.example.com',
+    'referer': 'https://my-remote-app.example.com/session/123',
     'accept-encoding': 'gzip, deflate, br',
     'user-agent': 'TestAgent'
   };
@@ -163,6 +163,17 @@ test('9. Injected Drawer Snippet & Mobile Tap Reliability', () => {
   assert(snippet.includes('id="__ag_git_iframe"'), 'Must contain iframe');
   assert(snippet.includes('onclick="window.__toggleAgGit(event)"'), 'Must have explicit onclick handler for universal mobile tap support');
   assert(snippet.includes('width:48px;height:48px;border-radius:50%'), 'Must be a circular 48px Material FAB');
+
+  const scriptMatch = snippet.match(/<script>(.*?)<\/script>/s);
+  assert(scriptMatch, 'Snippet must contain <script> tag');
+  try {
+    new Function(scriptMatch[1]);
+  } catch (e) {
+    const lines = scriptMatch[1].split('\n');
+    lines.forEach((l, idx) => console.log((idx + 1) + ': ' + l));
+    console.error('DRAWER SNIPPET SYNTAX ERROR:', e);
+    throw e;
+  }
 });
 
 test('10. Client Socket Close & Abort Handling (proxyResEnded scope)', async () => {
@@ -211,6 +222,32 @@ test('11. Git UI SSR HTML Validity & Diff Fetching', async () => {
     console.error('SCRIPT SYNTAX ERROR:', e);
     throw e;
   }
+});
+
+test('12. Active Project Auto-Detection & Dropdown Matching', () => {
+  const fakeRepos = [
+    { name: 'antigravity_remote', path: '/home/user/dev/antigravity_remote' },
+    { name: 'lectures', path: '/home/user/dev/lectures' },
+    { name: 'astrolabys', path: '/home/user/dev/astrolabys' }
+  ];
+
+  assert.equal(
+    gitInspector.matchRepo('tab=file__file%3A%2F%2F%2Fhome%2Fuser%2Fdev%2Flectures%2Ftest.js', fakeRepos),
+    '/home/user/dev/lectures',
+    'Must match lectures from URL parameter'
+  );
+
+  assert.equal(
+    gitInspector.matchRepo('astrolabys - Antigravity', fakeRepos),
+    '/home/user/dev/astrolabys',
+    'Must match astrolabys from window title'
+  );
+
+  assert.equal(
+    gitInspector.matchRepo('', fakeRepos),
+    '/home/user/dev/antigravity_remote',
+    'Must fallback to first repo when no hint is provided'
+  );
 });
 
 function makeRequest(port, path, method = 'GET', headers = {}, postData = '') {

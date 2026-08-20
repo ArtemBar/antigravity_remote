@@ -361,7 +361,7 @@ async function handleAuthAndProxy(req, res) {
   }
 
   if (reqUrl.pathname === '/__git') {
-    return renderGitUi(res);
+    return renderGitUi(res, reqUrl);
   }
   if (reqUrl.pathname.startsWith('/__git/api/')) {
     return handleGitApi(req, res, reqUrl);
