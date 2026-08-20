@@ -1209,10 +1209,27 @@ function launchCloudflareTunnel() {
       return;
     }
 
-    if (!quickTunnelUrl) {
+    const isBenignNotice = (line) => {
+      return (
+        line.includes('error code 0') ||
+        line.includes('canceled by remote') ||
+        line.includes('context canceled') ||
+        line.includes('ended abruptly') ||
+        line.includes('/dev/null was empty')
+      );
+    };
+
+    if (CUSTOM_DOMAIN) {
       const cleanLines = str.split('\n').map(l => l.trim()).filter(Boolean);
       for (const line of cleanLines) {
-        if (!line.includes('error code 0') && !line.includes('canceled by remote')) {
+        if (!isBenignNotice(line) && (line.includes('ERR') || line.includes('Registered tunnel') || line.includes('Retrying'))) {
+          console.log(`[tunnel] ${line}`);
+        }
+      }
+    } else if (!quickTunnelUrl) {
+      const cleanLines = str.split('\n').map(l => l.trim()).filter(Boolean);
+      for (const line of cleanLines) {
+        if (!isBenignNotice(line)) {
           console.log(`[tunnel] ${line}`);
         }
       }
