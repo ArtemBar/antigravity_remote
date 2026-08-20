@@ -182,7 +182,7 @@ function handleGitApi(req, res, url) {
 
   if (url.pathname === '/__git/api/status') {
     const branch = executeGit(repoPath, 'rev-parse --abbrev-ref HEAD').trim();
-    const statusRaw = executeGit(repoPath, 'status --porcelain=v1');
+    const statusRaw = executeGit(repoPath, 'status --porcelain=v1 -uall');
     const files = [];
 
     statusRaw.split('\n').filter(Boolean).forEach(line => {
@@ -208,6 +208,9 @@ function handleGitApi(req, res, url) {
       diffOutput = executeGit(repoPath, `diff --staged ${filePath ? `-- "${filePath}"` : ''}`);
     } else {
       diffOutput = executeGit(repoPath, `diff ${filePath ? `-- "${filePath}"` : ''}`);
+      if (!diffOutput.trim() && filePath && fs.existsSync(path.join(repoPath, filePath))) {
+        diffOutput = executeGit(repoPath, `diff --no-index -- /dev/null "${filePath}"`);
+      }
     }
 
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -289,9 +292,9 @@ function renderGitUi(res) {
     }
     .file-item:hover, .commit-item:hover { background: #2a2d2e; }
     .file-item.selected, .commit-item.selected { background: #04395e; color: #ffffff; border-left: 3px solid var(--accent); }
-    .status-badge { font-size: 0.68rem; font-weight: 700; padding: 2px 5px; border-radius: 3px; font-family: monospace; }
+    .status-badge { font-size: 0.68rem; font-weight: 700; padding: 2px 5px; border-radius: 3px; font-family: monospace; flex-shrink: 0; }
     .badge-M { background: #cca700; color: #000; }
-    .badge-A, .badge-question { background: #2ea043; color: #fff; }
+    .badge-A, .badge-U, .badge-question { background: #2ea043; color: #fff; }
     .badge-D { background: #f85149; color: #fff; }
     
     .file-diff-card {
@@ -429,16 +432,31 @@ function renderGitUi(res) {
       data.files.forEach((f, idx) => {
         const item = document.createElement('div');
         item.className = 'file-item' + (selectedItem === f.path ? ' selected' : '');
-        const statusLetter = f.index !== ' ' && f.index !== '?' ? f.index : (f.workTree || '?');
-        const badgeClass = statusLetter === 'M' ? 'badge-M' : (statusLetter === 'D' ? 'badge-D' : 'badge-A');
         
-        const cleanName = decodeGitOctalOnly(f.path);
-        item.innerHTML = '<span style="word-break:break-all;">' + escapeHtml(cleanName) + '</span><span class="status-badge ' + badgeClass + '">' + statusLetter + '</span>';
+        let statusLetter = f.index !== ' ' && f.index !== '?' ? f.index : (f.workTree || '?');
+        if (statusLetter === '?') statusLetter = 'U';
+        
+        const badgeClass = statusLetter === 'M' ? 'badge-M' : (statusLetter === 'D' ? 'badge-D' : 'badge-U');
+        const cleanPath = decodeGitOctalOnly(f.path);
+        
+        const lastSlash = cleanPath.lastIndexOf('/');
+        const fileName = lastSlash !== -1 ? cleanPath.substring(lastSlash + 1) : cleanPath;
+        const dirName = lastSlash !== -1 ? cleanPath.substring(0, lastSlash) : '';
+
+        let html = '<div style="display:flex; flex-direction:column; overflow:hidden; flex:1; min-width:0; margin-right:8px;" title="' + escapeHtml(cleanPath) + '">';
+        html += '<span style="font-weight:500; color:var(--text-bright); text-overflow:ellipsis; overflow:hidden; white-space:nowrap;">' + escapeHtml(fileName) + '</span>';
+        if (dirName) {
+          html += '<span style="font-size:0.73rem; color:var(--text-muted); text-overflow:ellipsis; overflow:hidden; white-space:nowrap; margin-top:2px;">' + escapeHtml(dirName) + '</span>';
+        }
+        html += '</div>';
+        html += '<span class="status-badge ' + badgeClass + '">' + statusLetter + '</span>';
+
+        item.innerHTML = html;
         item.onclick = () => {
           selectedItem = f.path;
           document.querySelectorAll('.file-item').forEach(el => el.classList.remove('selected'));
           item.classList.add('selected');
-          showDiff(f.path, cleanName);
+          showDiff(f.path, cleanPath);
         };
         sidebar.appendChild(item);
         if (idx === 0 && !selectedItem) item.click();
@@ -1267,28 +1285,43 @@ process.on('SIGTERM', shutdown);
 // -------------------------------------------------------------
 // Main Entrypoint
 // -------------------------------------------------------------
-(async () => {
-  ensureCloudflareConfig();
+if (require.main === module) {
+  (async () => {
+    ensureCloudflareConfig();
 
-  const initialPort = await getAntigravityPort();
+    const initialPort = await getAntigravityPort();
 
-  server.listen(LISTEN_PORT, '0.0.0.0', () => {
-    launchCloudflareTunnel();
+    server.listen(LISTEN_PORT, '0.0.0.0', () => {
+      launchCloudflareTunnel();
 
-    console.log(`\n=============================================================`);
-    console.log(`🚀 ANTIGRAVITY REMOTE GATEWAY READY!`);
-    console.log(`=============================================================`);
-    if (initialPort) {
-      console.log(`🎯 Active Antigravity Backend: 127.0.0.1:${initialPort}`);
-    }
-    console.log(`🔑 Passkey: ${SECRET_TOKEN}`);
-    if (CUSTOM_DOMAIN) {
-      console.log(`🌐 Public URL: https://${CUSTOM_DOMAIN}`);
-      console.log(`🌿 Direct Git UI: https://${CUSTOM_DOMAIN}/__git`);
-      console.log(`👉 Instant Auth Link: https://${CUSTOM_DOMAIN}/?token=${SECRET_TOKEN}`);
-    } else {
-      console.log(`⏳ Public URL: Connecting to Cloudflare Quick Tunnel (takes ~5-8s)...`);
-    }
-    console.log(`=============================================================\n`);
-  });
-})();
+      console.log(`\n=============================================================`);
+      console.log(`🚀 ANTIGRAVITY REMOTE GATEWAY READY!`);
+      console.log(`=============================================================`);
+      if (initialPort) {
+        console.log(`🎯 Active Antigravity Backend: 127.0.0.1:${initialPort}`);
+      }
+      console.log(`🔑 Passkey: ${SECRET_TOKEN}`);
+      if (CUSTOM_DOMAIN) {
+        console.log(`🌐 Public URL: https://${CUSTOM_DOMAIN}`);
+        console.log(`🌿 Direct Git UI: https://${CUSTOM_DOMAIN}/__git`);
+        console.log(`👉 Instant Auth Link: https://${CUSTOM_DOMAIN}/?token=${SECRET_TOKEN}`);
+      } else {
+        console.log(`⏳ Public URL: Connecting to Cloudflare Quick Tunnel (takes ~5-8s)...`);
+      }
+      console.log(`=============================================================\n`);
+    });
+  })();
+}
+
+module.exports = {
+  findGitRepos,
+  executeGit,
+  prepareUpstreamHeaders,
+  parseCookies,
+  isAuthenticated,
+  handleAuthAndProxy,
+  server,
+  SECRET_TOKEN,
+  LISTEN_PORT,
+  CUSTOM_DOMAIN
+};

@@ -6,6 +6,9 @@
   "bin": {
     "antigravity-remote": "./index.js"
   },
+  "scripts": {
+    "test": "node --test test.js"
+  },
   "keywords": [
     "antigravity",
     "google-antigravity",
