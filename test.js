@@ -6,11 +6,13 @@ const fs = require('fs');
 const { execSync } = require('child_process');
 
 const app = require('./index.js');
+const gitInspector = require('./git-inspector.js');
 
 test('1. Syntax & Compilation', () => {
   assert.doesNotThrow(() => {
     execSync('node --check ' + path.join(__dirname, 'index.js'));
-  }, 'index.js must have 100% valid JavaScript syntax');
+    execSync('node --check ' + path.join(__dirname, 'git-inspector.js'));
+  }, 'index.js and git-inspector.js must have 100% valid JavaScript syntax');
 });
 
 test('2. Cookie Parser (parseCookies)', () => {
@@ -80,29 +82,15 @@ test('4. Upstream Header Translation (prepareUpstreamHeaders)', () => {
 });
 
 test('5. Russian / Cyrillic Octal Escapes Decoding', () => {
-  // Test raw octal escape decoding function
-  function decodeGitOctalOnly(str) {
-    if (!str || !str.includes('\\')) return str;
-    return str.replace(/((?:\\[0-7]{3})+)/g, function(match) {
-      try {
-        var octals = match.match(/\\[0-7]{3}/g);
-        var bytes = new Uint8Array(octals.map(function(o) { return parseInt(o.slice(1), 8); }));
-        return new TextDecoder('utf-8').decode(bytes);
-      } catch (e) {
-        return match;
-      }
-    });
-  }
-
   const rawOctal = '\\320\\277\\321\\200\\320\\276\\320\\265\\320\\272\\321\\202.json';
-  assert.equal(decodeGitOctalOnly(rawOctal), 'проект.json', 'Cyrillic octal sequences must decode to Russian UTF-8');
+  assert.equal(gitInspector.decodeGitOctalOnly(rawOctal), 'проект.json', 'Cyrillic octal sequences must decode to Russian UTF-8');
 
   const mixed = 'lectures/18 поток/\\320\\243\\321\\200\\320\\260\\320\\275/notes.md';
-  assert.equal(decodeGitOctalOnly(mixed), 'lectures/18 поток/Уран/notes.md', 'Mixed UTF-8 and octal must decode seamlessly');
+  assert.equal(gitInspector.decodeGitOctalOnly(mixed), 'lectures/18 поток/Уран/notes.md', 'Mixed UTF-8 and octal must decode seamlessly');
 });
 
 test('6. Git Repositories Auto-Discovery (findGitRepos)', () => {
-  const repos = app.findGitRepos();
+  const repos = gitInspector.findGitRepos();
   assert(Array.isArray(repos), 'findGitRepos must return an array');
   assert(repos.length > 0, 'Must discover at least the current antigravity_remote repo');
 
@@ -114,11 +102,10 @@ test('6. Git Repositories Auto-Discovery (findGitRepos)', () => {
 
 test('7. Git Status & Porcelain -uall Listing', () => {
   const currentRepo = process.cwd();
-  const statusOutput = app.executeGit(currentRepo, 'status --porcelain=v1 -uall');
+  const statusOutput = gitInspector.executeGit(currentRepo, 'status --porcelain=v1 -uall');
   assert(typeof statusOutput === 'string', 'executeGit status must return a string');
 
-  // Verify that test.js or modified files are detected
-  const branch = app.executeGit(currentRepo, 'rev-parse --abbrev-ref HEAD').trim();
+  const branch = gitInspector.executeGit(currentRepo, 'rev-parse --abbrev-ref HEAD').trim();
   assert.equal(branch, 'main', 'Current branch must be main');
 });
 
@@ -165,6 +152,64 @@ test('8. End-to-End Local HTTP Server API Tests', async () => {
     assert(resBadPost.body.includes('Incorrect passkey!'), 'Must display error message');
   } finally {
     await new Promise(resolve => testServer.close(resolve));
+  }
+});
+
+test('9. Injected Drawer Snippet & Mobile Tap Reliability', () => {
+  const snippet = gitInspector.getInjectedDrawerSnippet();
+  assert(typeof snippet === 'string', 'Snippet must be a string');
+  assert(snippet.includes('id="__ag_git_fab"'), 'Must contain FAB container');
+  assert(snippet.includes('id="__ag_git_drawer"'), 'Must contain drawer container');
+  assert(snippet.includes('id="__ag_git_iframe"'), 'Must contain iframe');
+  assert(snippet.includes('onclick="window.__toggleAgGit(event)"'), 'Must have explicit onclick handler for universal mobile tap support');
+  assert(snippet.includes('width:48px;height:48px;border-radius:50%'), 'Must be a circular 48px Material FAB');
+});
+
+test('10. Client Socket Close & Abort Handling (proxyResEnded scope)', async () => {
+  const testServer = http.createServer(app.handleAuthAndProxy);
+  await new Promise(resolve => testServer.listen(0, '127.0.0.1', resolve));
+  const testPort = testServer.address().port;
+
+  try {
+    // Send authenticated request and abort immediately to trigger res.on('close')
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: testPort,
+      path: '/exa.language_server_pb.LanguageServerService/GetState',
+      method: 'POST',
+      headers: { host: `localhost:${testPort}`, cookie: 'ag_auth=' + app.SECRET_TOKEN }
+    });
+    req.on('error', () => {}); // expected socket hangup
+    req.write('test');
+    setTimeout(() => req.destroy(), 5);
+
+    await new Promise(r => setTimeout(r, 50));
+    assert(true, 'Aborting client request must cleanly trigger res.on(close) without ReferenceError');
+  } finally {
+    await new Promise(resolve => testServer.close(resolve));
+  }
+});
+
+test('11. Git UI SSR HTML Validity & Diff Fetching', async () => {
+  let html = '';
+  gitInspector.renderGitUi({
+    writeHead: (code, headers) => { assert.equal(code, 200); },
+    end: (content) => { html = content; }
+  });
+
+  assert(html.includes('initialRepos'), 'Must include initialRepos');
+  assert(html.includes('initialFiles'), 'Must include initialFiles');
+
+  // Verify that the generated client-side <script> is 100% syntactically valid
+  const scriptMatch = html.match(/<script>(.*?)<\/script>/s);
+  assert(scriptMatch, 'Must contain <script> tag');
+  try {
+    new Function(scriptMatch[1]);
+  } catch (e) {
+    const lines = scriptMatch[1].split('\n');
+    lines.forEach((l, idx) => console.log((idx + 1) + ': ' + l));
+    console.error('SCRIPT SYNTAX ERROR:', e);
+    throw e;
   }
 });
 

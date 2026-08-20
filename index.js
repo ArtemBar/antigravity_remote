@@ -1,41 +1,45 @@
 #!/usr/bin/env node
 
-const fs = require('fs');
-const path = require('path');
+/**
+ * 🚀 Antigravity Remote Access Gateway
+ * High-throughput remote proxy for Google Antigravity with Cloudflare Named Tunnels,
+ * dynamic port discovery, and visual Git Inspector.
+ *
+ * Author: Artem Barinov
+ * License: MIT
+ */
+
 const http = require('http');
 const https = require('https');
 const tls = require('tls');
-const zlib = require('zlib');
+const fs = require('fs');
+const path = require('path');
 const os = require('os');
+const zlib = require('zlib');
 const crypto = require('crypto');
-const { execSync, spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 
 // -------------------------------------------------------------
-// 0. Parse CLI Flags & Environment
+// 1. Environment & Configuration
 // -------------------------------------------------------------
+const ENV_FILE = path.join(__dirname, '.env');
+
 function loadEnv() {
-  const envPaths = [
-    path.join(__dirname, '.env'),
-    path.join(os.homedir(), '.antigravity_remote.env')
-  ];
-  for (const p of envPaths) {
-    if (fs.existsSync(p)) {
-      const lines = fs.readFileSync(p, 'utf8').split('\n');
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith('#')) {
-          const [key, ...vals] = trimmed.split('=');
-          if (key && vals.length > 0 && !process.env[key.trim()]) {
-            process.env[key.trim()] = vals.join('=').trim().replace(/^['"]|['"]$/g, '');
-          }
+  if (fs.existsSync(ENV_FILE)) {
+    const lines = fs.readFileSync(ENV_FILE, 'utf8').split('\n');
+    lines.forEach(line => {
+      line = line.trim();
+      if (line && !line.startsWith('#')) {
+        const [key, ...rest] = line.split('=');
+        if (key && rest.length) {
+          process.env[key.trim()] = rest.join('=').trim().replace(/^["']|["']$/g, '');
         }
       }
-    }
+    });
   }
 }
 loadEnv();
 
-// Parse CLI flags (e.g. --domain=..., --password=..., --port=..., --quick)
 const args = process.argv.slice(2);
 args.forEach(arg => {
   if (arg.startsWith('--domain=')) process.env.CUSTOM_DOMAIN = arg.split('=')[1];
@@ -51,26 +55,20 @@ args.forEach(arg => {
 const LISTEN_PORT = parseInt(process.env.LISTEN_PORT || '64650', 10);
 const TARGET_HOST = '127.0.0.1';
 
-// Defaults (Completely Generic & Safe for Open Source)
+// Defaults
 const SECRET_TOKEN = process.env.SECRET_TOKEN || crypto.randomBytes(8).toString('hex');
 const CUSTOM_DOMAIN = process.env.CUSTOM_DOMAIN || null;
 const TUNNEL_NAME = process.env.TUNNEL_NAME || 'antigravity-tunnel';
 
+// -------------------------------------------------------------
+// 2. Cloudflare Named Tunnel Auto-Provisioning
+// -------------------------------------------------------------
 const CLOUDFLARED_DIR = path.join(os.homedir(), '.cloudflared');
-const CONFIG_FILE = path.join(CLOUDFLARED_DIR, 'config.yml');
 const CERT_FILE = path.join(CLOUDFLARED_DIR, 'cert.pem');
+const CONFIG_FILE = path.join(CLOUDFLARED_DIR, 'config.yml');
 
-let cachedTargetPort = null;
-let isDiscovering = false;
-let tunnelProcess = null;
-let quickTunnelUrl = null;
-let lastRequestTime = Date.now();
-
-// -------------------------------------------------------------
-// 1. Automatic Cloudflare Setup Wizard
-// -------------------------------------------------------------
 function ensureCloudflareConfig() {
-  if (!CUSTOM_DOMAIN) return; // Quick tunnel requires no named config
+  if (!CUSTOM_DOMAIN) return;
 
   if (!fs.existsSync(CLOUDFLARED_DIR)) {
     fs.mkdirSync(CLOUDFLARED_DIR, { recursive: true });
@@ -124,583 +122,19 @@ function ensureCloudflareConfig() {
 }
 
 // -------------------------------------------------------------
-// 2. Git Repository & Diff Inspector Helpers
+// 3. Modular Git Inspector (Imported from git-inspector.js)
 // -------------------------------------------------------------
-function findGitRepos() {
-  const searchRoots = [
-    path.join(os.homedir(), 'dev'),
-    path.join(os.homedir(), 'Dev'),
-    process.cwd()
-  ];
-  const repos = new Map();
-
-  for (const root of searchRoots) {
-    if (!fs.existsSync(root)) continue;
-    try {
-      const realRoot = fs.realpathSync(root);
-      if (fs.existsSync(path.join(realRoot, '.git'))) {
-        repos.set(realRoot.toLowerCase(), { name: path.basename(realRoot), path: realRoot });
-      }
-      const entries = fs.readdirSync(realRoot, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
-          const subPath = path.join(realRoot, entry.name);
-          if (fs.existsSync(path.join(subPath, '.git'))) {
-            const realSub = fs.realpathSync(subPath);
-            repos.set(realSub.toLowerCase(), { name: entry.name, path: realSub });
-          }
-        }
-      }
-    } catch (e) {}
-  }
-
-  return Array.from(repos.values());
-}
-
-function executeGit(repoPath, args) {
-  try {
-    return execSync(`git -c core.quotepath=false ${args}`, { cwd: repoPath, encoding: 'utf8', maxBuffer: 25 * 1024 * 1024 });
-  } catch (e) {
-    return e.stdout ? e.stdout.toString('utf8') : '';
-  }
-}
-
-function handleGitApi(req, res, url) {
-  const params = url.searchParams;
-  const repos = findGitRepos();
-  const repoPath = params.get('repo') || (repos[0]?.path);
-
-  if (url.pathname === '/__git/api/repos') {
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    return res.end(JSON.stringify(repos));
-  }
-
-  if (!repoPath || !fs.existsSync(repoPath)) {
-    res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-    return res.end(JSON.stringify({ error: 'Repository not found' }));
-  }
-
-  if (url.pathname === '/__git/api/status') {
-    const branch = executeGit(repoPath, 'rev-parse --abbrev-ref HEAD').trim();
-    const statusRaw = executeGit(repoPath, 'status --porcelain=v1 -uall');
-    const files = [];
-
-    statusRaw.split('\n').filter(Boolean).forEach(line => {
-      const indexStatus = line.substring(0, 1);
-      const workTreeStatus = line.substring(1, 2);
-      const filePath = line.substring(3).trim().replace(/^"|"$/g, '');
-      files.push({ path: filePath, index: indexStatus, workTree: workTreeStatus });
-    });
-
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    return res.end(JSON.stringify({ repo: repoPath, branch, files }));
-  }
-
-  if (url.pathname === '/__git/api/diff') {
-    const filePath = params.get('file');
-    const commitHash = params.get('commit');
-    const staged = params.get('staged') === 'true';
-
-    let diffOutput = '';
-    if (commitHash) {
-      diffOutput = executeGit(repoPath, `show --format=fuller ${commitHash} ${filePath ? `-- "${filePath}"` : ''}`);
-    } else if (staged) {
-      diffOutput = executeGit(repoPath, `diff --staged ${filePath ? `-- "${filePath}"` : ''}`);
-    } else {
-      diffOutput = executeGit(repoPath, `diff ${filePath ? `-- "${filePath}"` : ''}`);
-      if (!diffOutput.trim() && filePath && fs.existsSync(path.join(repoPath, filePath))) {
-        diffOutput = executeGit(repoPath, `diff --no-index -- /dev/null "${filePath}"`);
-      }
-    }
-
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end(diffOutput);
-  }
-
-  if (url.pathname === '/__git/api/log') {
-    const limit = parseInt(params.get('limit') || '40', 10);
-    const logRaw = executeGit(repoPath, `log -n ${limit} --pretty=format:"%H|%h|%an|%ar|%s"`);
-    const commits = logRaw.split('\n').filter(Boolean).map(line => {
-      const [fullHash, hash, author, time, ...msgParts] = line.split('|');
-      return { fullHash, hash, author, time, message: msgParts.join('|') };
-    });
-
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    return res.end(JSON.stringify(commits));
-  }
-
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
-  res.end('Not Found');
-}
-
-function renderGitUi(res) {
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Git Inspector</title>
-  <style>
-    :root {
-      --bg: #181818;
-      --editor-bg: #1e1e1e;
-      --card: #252526;
-      --border: #2d2d2d;
-      --border-focus: #007acc;
-      --text: #cccccc;
-      --text-bright: #ffffff;
-      --text-muted: #858585;
-      --accent: #007acc;
-      --accent-hover: #1f8ad2;
-      --diff-add-bg: rgba(46, 160, 67, 0.15);
-      --diff-add-text: #7ee787;
-      --diff-add-word: rgba(46, 160, 67, 0.45);
-      --diff-del-bg: rgba(248, 81, 73, 0.15);
-      --diff-del-text: #ff7b72;
-      --diff-del-word: rgba(248, 81, 73, 0.45);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh; overflow: hidden;
-    }
-    header {
-      background: var(--card); border-bottom: 1px solid var(--border); padding: 0.6rem 1rem;
-      display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; flex-shrink: 0;
-    }
-    .header-left { display: flex; align-items: center; gap: 0.75rem; }
-    h1 { font-size: 0.95rem; font-weight: 600; margin: 0; display: flex; align-items: center; gap: 0.5rem; color: var(--text-bright); }
-    select, button {
-      background: var(--editor-bg); color: var(--text); border: 1px solid var(--border);
-      padding: 0.35rem 0.75rem; border-radius: 4px; font-size: 0.82rem; cursor: pointer; transition: all 0.15s ease;
-    }
-    select:focus, button:focus { outline: none; border-color: var(--border-focus); }
-    button.active { background: var(--accent); color: #ffffff; border-color: var(--accent); font-weight: 500; }
-    button:hover:not(.active) { background: #2a2d2e; color: var(--text-bright); }
-    .tabs { display: flex; gap: 0.4rem; }
-    .main-container { display: flex; flex: 1; overflow: hidden; position: relative; }
-    .sidebar {
-      width: 360px; min-width: 240px; background: var(--bg); border-right: 1px solid var(--border);
-      display: flex; flex-direction: column; overflow-y: auto; flex-shrink: 0;
-    }
-    .content { flex: 1; padding: 1rem 1.25rem; overflow-y: auto; background: var(--editor-bg); }
-    .file-item, .commit-item {
-      padding: 0.65rem 0.9rem; border-bottom: 1px solid #232323;
-      cursor: pointer; display: flex; align-items: center; justify-content: space-between; font-size: 0.83rem;
-      transition: background 0.1s ease;
-    }
-    .file-item:hover, .commit-item:hover { background: #2a2d2e; }
-    .file-item.selected, .commit-item.selected { background: #04395e; color: #ffffff; border-left: 3px solid var(--accent); }
-    .status-badge { font-size: 0.68rem; font-weight: 700; padding: 2px 5px; border-radius: 3px; font-family: monospace; flex-shrink: 0; }
-    .badge-M { background: #cca700; color: #000; }
-    .badge-A, .badge-U, .badge-question { background: #2ea043; color: #fff; }
-    .badge-D { background: #f85149; color: #fff; }
-    
-    .file-diff-card {
-      background: var(--editor-bg); border: 1px solid var(--border); border-radius: 6px;
-      margin-bottom: 1rem; overflow: hidden; box-shadow: 0 2px 6px rgba(0,0,0,0.2);
-    }
-    .file-diff-header {
-      background: #252526; padding: 0.55rem 0.9rem; font-size: 0.84rem; font-weight: 600;
-      color: var(--text-bright); border-bottom: 1px solid var(--border); display: flex;
-      justify-content: space-between; align-items: center; cursor: pointer; user-select: none;
-    }
-    .file-diff-header:hover { background: #2d2d30; }
-    .file-title-left { display: flex; align-items: center; gap: 0.6rem; word-break: break-all; }
-    .file-chevron { font-size: 0.75rem; color: #858585; transition: transform 0.15s ease; width: 12px; text-align: center; }
-    .file-diff-card.collapsed .file-chevron { transform: rotate(-90deg); }
-    .file-diff-card.collapsed .file-diff-body { display: none; }
-    .file-diff-card.collapsed .file-diff-header { border-bottom: none; }
-    
-    .file-stats { display: flex; gap: 0.5rem; font-size: 0.75rem; font-family: monospace; }
-    .stat-add { color: #7ee787; font-weight: bold; }
-    .stat-del { color: #ff7b72; font-weight: bold; }
-
-    .commit-meta-box {
-      background: #252526; border: 1px solid var(--border); border-radius: 6px;
-      padding: 0.9rem 1.1rem; margin-bottom: 1.25rem;
-    }
-    .commit-meta-title { font-size: 1.05rem; font-weight: 600; color: #ffffff; margin-bottom: 0.5rem; line-height: 1.4; word-break: break-word; }
-    .commit-meta-details { font-size: 0.78rem; color: #858585; line-height: 1.5; }
-    .commit-toolbar {
-      display: flex; justify-content: space-between; align-items: center; margin-top: 0.75rem;
-      padding-top: 0.75rem; border-top: 1px solid #333333;
-    }
-    .toolbar-btn {
-      background: #181818; color: var(--text); border: 1px solid #333333;
-      padding: 0.25rem 0.6rem; border-radius: 3px; font-size: 0.75rem; cursor: pointer;
-    }
-    .toolbar-btn:hover { background: #333333; color: #ffffff; }
-
-    .diff-lines { font-family: "Cascadia Code", "Fira Code", Menlo, Monaco, Consolas, "Courier New", monospace; font-size: 0.81rem; line-height: 1.55; white-space: pre-wrap; word-break: break-all; }
-    .diff-line { padding: 1px 0.75rem; display: flex; }
-    .diff-line.add { background: var(--diff-add-bg); color: var(--diff-add-text); }
-    .diff-line.del { background: var(--diff-del-bg); color: var(--diff-del-text); }
-    .diff-line.info { color: #58a6ff; background: rgba(88, 166, 255, 0.08); padding-top: 3px; padding-bottom: 3px; border-top: 1px solid rgba(88, 166, 255, 0.15); border-bottom: 1px solid rgba(88, 166, 255, 0.15); }
-    .diff-line.meta { color: var(--text-muted); background: #1a1a1a; font-size: 0.76rem; }
-    .diff-num { width: 35px; user-select: none; color: #6e7681; text-align: right; margin-right: 0.9rem; flex-shrink: 0; font-size: 0.75rem; }
-    .diff-code { flex: 1; }
-    ins { background: var(--diff-add-word); text-decoration: none; border-radius: 2px; padding: 0 2px; }
-    del { background: var(--diff-del-word); text-decoration: none; border-radius: 2px; padding: 0 2px; }
-    .empty-state { text-align: center; color: var(--text-muted); padding: 4rem 1rem; font-size: 0.95rem; }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="header-left">
-      <h1>🌿 Git Inspector</h1>
-      <select id="repoSelect"></select>
-      <span id="branchBadge" style="font-size:0.78rem; color:#58a6ff; background:rgba(88,166,255,0.12); padding:2px 7px; border-radius:3px; font-weight:500;"></span>
-    </div>
-    <div class="tabs">
-      <button id="tabWorking" class="active">Uncommitted</button>
-      <button id="tabHistory">Commit History</button>
-      <button id="btnRefresh">🔄</button>
-    </div>
-  </header>
-
-  <div class="main-container">
-    <div class="sidebar" id="sidebarList"></div>
-    <div class="content" id="diffContent">
-      <div class="empty-state">Select a file or commit to inspect word-by-word diffs</div>
-    </div>
-  </div>
-
-  <script>
-    let currentRepo = '';
-    let currentTab = 'working';
-    let selectedItem = null;
-
-    function decodeGitOctalOnly(str) {
-      if (!str || !str.includes('\\\\')) return str;
-      return str.replace(/((?:\\\\[0-7]{3})+)/g, function(match) {
-        try {
-          var octals = match.match(/\\\\[0-7]{3}/g);
-          var bytes = new Uint8Array(octals.map(function(o) { return parseInt(o.slice(1), 8); }));
-          return new TextDecoder('utf-8').decode(bytes);
-        } catch (e) {
-          return match;
-        }
-      });
-    }
-
-    async function fetchJson(url) {
-      const res = await fetch(url);
-      return res.json();
-    }
-
-    async function loadRepos() {
-      const repos = await fetchJson('/__git/api/repos');
-      const select = document.getElementById('repoSelect');
-      select.innerHTML = '';
-      if (repos.length === 0) {
-        select.innerHTML = '<option value="">No Git repos found</option>';
-        return;
-      }
-      repos.forEach(r => {
-        const opt = document.createElement('option');
-        opt.value = r.path;
-        opt.textContent = r.name;
-        select.appendChild(opt);
-      });
-      currentRepo = repos[0].path;
-      loadView();
-    }
-
-    async function loadView() {
-      if (!currentRepo) return;
-      if (currentTab === 'working') {
-        loadWorkingChanges();
-      } else {
-        loadCommitHistory();
-      }
-    }
-
-    async function loadWorkingChanges() {
-      const data = await fetchJson('/__git/api/status?repo=' + encodeURIComponent(currentRepo));
-      document.getElementById('branchBadge').textContent = data.branch;
-      const sidebar = document.getElementById('sidebarList');
-      sidebar.innerHTML = '';
-
-      if (data.files.length === 0) {
-        sidebar.innerHTML = '<div style="padding:1.5rem; color:#6e7681; font-size:0.83rem; text-align:center;">Working tree clean ✨</div>';
-        document.getElementById('diffContent').innerHTML = '<div class="empty-state">No uncommitted changes in this project ✨</div>';
-        return;
-      }
-
-      data.files.forEach((f, idx) => {
-        const item = document.createElement('div');
-        item.className = 'file-item' + (selectedItem === f.path ? ' selected' : '');
-        
-        let statusLetter = f.index !== ' ' && f.index !== '?' ? f.index : (f.workTree || '?');
-        if (statusLetter === '?') statusLetter = 'U';
-        
-        const badgeClass = statusLetter === 'M' ? 'badge-M' : (statusLetter === 'D' ? 'badge-D' : 'badge-U');
-        const cleanPath = decodeGitOctalOnly(f.path);
-        
-        const lastSlash = cleanPath.lastIndexOf('/');
-        const fileName = lastSlash !== -1 ? cleanPath.substring(lastSlash + 1) : cleanPath;
-        const dirName = lastSlash !== -1 ? cleanPath.substring(0, lastSlash) : '';
-
-        let html = '<div style="display:flex; flex-direction:column; overflow:hidden; flex:1; min-width:0; margin-right:8px;" title="' + escapeHtml(cleanPath) + '">';
-        html += '<span style="font-weight:500; color:var(--text-bright); text-overflow:ellipsis; overflow:hidden; white-space:nowrap;">' + escapeHtml(fileName) + '</span>';
-        if (dirName) {
-          html += '<span style="font-size:0.73rem; color:var(--text-muted); text-overflow:ellipsis; overflow:hidden; white-space:nowrap; margin-top:2px;">' + escapeHtml(dirName) + '</span>';
-        }
-        html += '</div>';
-        html += '<span class="status-badge ' + badgeClass + '">' + statusLetter + '</span>';
-
-        item.innerHTML = html;
-        item.onclick = () => {
-          selectedItem = f.path;
-          document.querySelectorAll('.file-item').forEach(el => el.classList.remove('selected'));
-          item.classList.add('selected');
-          showDiff(f.path, cleanPath);
-        };
-        sidebar.appendChild(item);
-        if (idx === 0 && !selectedItem) item.click();
-      });
-    }
-
-    async function loadCommitHistory() {
-      const commits = await fetchJson('/__git/api/log?limit=40&repo=' + encodeURIComponent(currentRepo));
-      const sidebar = document.getElementById('sidebarList');
-      sidebar.innerHTML = '';
-
-      commits.forEach((c, idx) => {
-        const item = document.createElement('div');
-        item.className = 'commit-item' + (selectedItem === c.fullHash ? ' selected' : '');
-        item.innerHTML = '<div style="width:100%;"><div style="font-weight:600; color:#ffffff; word-break:break-word;">' + escapeHtml(c.message) + '</div><div style="font-size:0.74rem; color:#858585; margin-top:3px;">' + c.hash + ' • ' + escapeHtml(c.author) + ' • ' + c.time + '</div></div>';
-        item.onclick = () => {
-          selectedItem = c.fullHash;
-          document.querySelectorAll('.commit-item').forEach(el => el.classList.remove('selected'));
-          item.classList.add('selected');
-          showCommitDiff(c.fullHash, c.message);
-        };
-        sidebar.appendChild(item);
-        if (idx === 0 && !selectedItem) item.click();
-      });
-    }
-
-    async function showDiff(filePath, cleanName) {
-      const res = await fetch('/__git/api/diff?repo=' + encodeURIComponent(currentRepo) + '&file=' + encodeURIComponent(filePath));
-      const text = await res.text();
-      renderSingleFileDiff(text, cleanName || filePath);
-    }
-
-    async function showCommitDiff(hash, msg) {
-      const res = await fetch('/__git/api/diff?repo=' + encodeURIComponent(currentRepo) + '&commit=' + encodeURIComponent(hash));
-      const text = await res.text();
-      renderCommitMultiDiff(text, hash, msg);
-    }
-
-    function escapeHtml(str) {
-      return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
-
-    function highlightWordDiff(delLine, addLine) {
-      const delWords = delLine.split(/(\\s+|[^a-zA-Z0-9_\\u0400-\\u04FF])/);
-      const addWords = addLine.split(/(\\s+|[^a-zA-Z0-9_\\u0400-\\u04FF])/);
-
-      let delHtml = '';
-      let addHtml = '';
-
-      let i = 0, j = 0;
-      while (i < delWords.length || j < addWords.length) {
-        if (i < delWords.length && j < addWords.length && delWords[i] === addWords[j]) {
-          delHtml += escapeHtml(delWords[i]);
-          addHtml += escapeHtml(addWords[j]);
-          i++; j++;
-        } else {
-          if (i < delWords.length) {
-            delHtml += '<del>' + escapeHtml(delWords[i]) + '</del>';
-            i++;
-          }
-          if (j < addWords.length) {
-            addHtml += '<ins>' + escapeHtml(addWords[j]) + '</ins>';
-            j++;
-          }
-        }
-      }
-      return { delHtml, addHtml };
-    }
-
-    function renderDiffLinesHtml(lines) {
-      let html = '<div class="diff-lines">';
-      let i = 0;
-      while (i < lines.length) {
-        const line = lines[i];
-        if (line.startsWith('@@')) {
-          html += '<div class="diff-line info"><span class="diff-num"> </span><span class="diff-code">' + escapeHtml(line) + '</span></div>';
-          i++;
-        } else if (line.startsWith('diff ') || line.startsWith('index ') || line.startsWith('---') || line.startsWith('+++') || line.startsWith('new file') || line.startsWith('deleted file') || line.startsWith('similarity index') || line.startsWith('rename ')) {
-          html += '<div class="diff-line meta"><span class="diff-num"> </span><span class="diff-code">' + escapeHtml(line) + '</span></div>';
-          i++;
-        } else if (line.startsWith('-') && i + 1 < lines.length && lines[i + 1].startsWith('+')) {
-          const { delHtml, addHtml } = highlightWordDiff(line.slice(1), lines[i + 1].slice(1));
-          html += '<div class="diff-line del"><span class="diff-num">-</span><span class="diff-code">' + delHtml + '</span></div>';
-          html += '<div class="diff-line add"><span class="diff-num">+</span><span class="diff-code">' + addHtml + '</span></div>';
-          i += 2;
-        } else if (line.startsWith('+') && !line.startsWith('+++')) {
-          html += '<div class="diff-line add"><span class="diff-num">+</span><span class="diff-code">' + escapeHtml(line.slice(1)) + '</span></div>';
-          i++;
-        } else if (line.startsWith('-') && !line.startsWith('---')) {
-          html += '<div class="diff-line del"><span class="diff-num">-</span><span class="diff-code">' + escapeHtml(line.slice(1)) + '</span></div>';
-          i++;
-        } else {
-          const content = line.startsWith(' ') ? line.slice(1) : line;
-          html += '<div class="diff-line"><span class="diff-num"> </span><span class="diff-code">' + escapeHtml(content) + '</span></div>';
-          i++;
-        }
-      }
-      html += '</div>';
-      return html;
-    }
-
-    function renderSingleFileDiff(diffText, title) {
-      const container = document.getElementById('diffContent');
-      if (!diffText.trim()) {
-        container.innerHTML = '<div class="empty-state">No diff for ' + escapeHtml(title) + '</div>';
-        return;
-      }
-      diffText = decodeGitOctalOnly(diffText);
-      const lines = diffText.split('\\n');
-
-      let html = '<div class="file-diff-card">';
-      html += '<div class="file-diff-header" onclick="this.parentElement.classList.toggle(\\'collapsed\\')">';
-      html += '<div class="file-title-left"><span class="file-chevron">▼</span><span>📄 ' + escapeHtml(title) + '</span></div>';
-      html += '</div>';
-      html += '<div class="file-diff-body">' + renderDiffLinesHtml(lines) + '</div>';
-      html += '</div>';
-
-      container.innerHTML = html;
-    }
-
-    function parseMultiFileDiff(rawText) {
-      rawText = decodeGitOctalOnly(rawText);
-
-      let commitHeader = '';
-      let bodyText = rawText;
-
-      const firstDiffIdx = rawText.indexOf('diff --git ');
-      if (firstDiffIdx > 0) {
-        commitHeader = rawText.substring(0, firstDiffIdx).trim();
-        bodyText = rawText.substring(firstDiffIdx);
-      } else if (firstDiffIdx === -1 && rawText.startsWith('commit ')) {
-        commitHeader = rawText.trim();
-        bodyText = '';
-      }
-
-      const files = [];
-      if (bodyText) {
-        const rawChunks = bodyText.split(/(?=diff --git )/);
-        for (const chunk of rawChunks) {
-          if (!chunk.trim()) continue;
-          const lines = chunk.split('\\n');
-          let filePath = '';
-          const m = lines[0].match(/diff --git a\\/(.*?) b\\/(.*)/);
-          if (m) {
-            filePath = m[2];
-          } else {
-            filePath = lines[0].replace('diff --git ', '');
-          }
-
-          let adds = 0, dels = 0;
-          for (const l of lines) {
-            if (l.startsWith('+') && !l.startsWith('+++')) adds++;
-            if (l.startsWith('-') && !l.startsWith('---')) dels++;
-          }
-
-          files.push({ filePath: filePath.trim(), adds, dels, lines });
-        }
-      }
-
-      return { commitHeader, files };
-    }
-
-    function renderCommitMultiDiff(diffText, hash, message) {
-      const container = document.getElementById('diffContent');
-      if (!diffText.trim()) {
-        container.innerHTML = '<div class="empty-state">No changes in commit ' + hash.substring(0, 8) + '</div>';
-        return;
-      }
-
-      const { commitHeader, files } = parseMultiFileDiff(diffText);
-
-      let html = '';
-
-      html += '<div class="commit-meta-box">';
-      html += '<div class="commit-meta-title">' + escapeHtml(message) + '</div>';
-      
-      let headerDetailsHtml = '';
-      if (commitHeader) {
-        const metaLines = commitHeader.split('\\n');
-        metaLines.forEach(ml => {
-          if (ml.startsWith('Author:') || ml.startsWith('CommitDate:') || ml.startsWith('Date:') || ml.startsWith('commit ')) {
-            headerDetailsHtml += '<div>' + escapeHtml(ml) + '</div>';
-          }
-        });
-      }
-      html += '<div class="commit-meta-details">' + (headerDetailsHtml || '<span>Commit ' + hash + '</span>') + '</div>';
-
-      html += '<div class="commit-toolbar">';
-      html += '<span style="font-size:0.78rem; font-weight:600; color:#ffffff;">📁 ' + files.length + ' changed file' + (files.length === 1 ? '' : 's') + '</span>';
-      html += '<div style="display:flex; gap:0.4rem;">';
-      html += '<button class="toolbar-btn" onclick="document.querySelectorAll(\\'.file-diff-card\\').forEach(c => c.classList.remove(\\'collapsed\\'))">Expand All</button>';
-      html += '<button class="toolbar-btn" onclick="document.querySelectorAll(\\'.file-diff-card\\').forEach(c => c.classList.add(\\'collapsed\\'))">Collapse All</button>';
-      html += '</div></div>';
-      html += '</div>';
-
-      if (files.length === 0) {
-        html += '<div class="empty-state">No file diffs to display</div>';
-      } else {
-        files.forEach(f => {
-          html += '<div class="file-diff-card">';
-          html += '<div class="file-diff-header" onclick="this.parentElement.classList.toggle(\\'collapsed\\')">';
-          html += '<div class="file-title-left"><span class="file-chevron">▼</span><span>📄 ' + escapeHtml(f.filePath) + '</span></div>';
-          html += '<div class="file-stats"><span class="stat-add">+' + f.adds + '</span><span class="stat-del">-' + f.dels + '</span></div>';
-          html += '</div>';
-          html += '<div class="file-diff-body">' + renderDiffLinesHtml(f.lines) + '</div>';
-          html += '</div>';
-        });
-      }
-
-      container.innerHTML = html;
-    }
-
-    document.getElementById('repoSelect').onchange = (e) => {
-      currentRepo = e.target.value;
-      selectedItem = null;
-      loadView();
-    };
-
-    document.getElementById('tabWorking').onclick = () => {
-      currentTab = 'working';
-      selectedItem = null;
-      document.getElementById('tabWorking').classList.add('active');
-      document.getElementById('tabHistory').classList.remove('active');
-      loadView();
-    };
-
-    document.getElementById('tabHistory').onclick = () => {
-      currentTab = 'history';
-      selectedItem = null;
-      document.getElementById('tabHistory').classList.add('active');
-      document.getElementById('tabWorking').classList.remove('active');
-      loadView();
-    };
-
-    document.getElementById('btnRefresh').onclick = loadView;
-
-    loadRepos();
-  </script>
-</body>
-</html>`);
-}
+const {
+  findGitRepos,
+  executeGit,
+  decodeGitOctalOnly,
+  handleGitApi,
+  renderGitUi,
+  getInjectedDrawerSnippet
+} = require('./git-inspector.js');
 
 // -------------------------------------------------------------
-// 3. Port Auto-Discovery & Zero-Leak Sockets
+// 4. Port Auto-Discovery & Zero-Leak Sockets
 // -------------------------------------------------------------
 function testPort(port) {
   if (!port) return Promise.resolve(false);
@@ -710,13 +144,11 @@ function testPort(port) {
       port: port,
       path: '/',
       method: 'GET',
-      headers: { host: `localhost:${port}`, connection: 'close' },
-      agent: false,
       rejectUnauthorized: false,
-      timeout: 300
+      timeout: 1000
     }, (res) => {
       res.resume();
-      res.on('end', () => resolve(res.statusCode === 200));
+      resolve(true);
     });
 
     req.on('error', () => resolve(false));
@@ -749,8 +181,8 @@ async function probeAndFindPort() {
     for (const p of candidatePorts) {
       if (await testPort(p)) {
         if (cachedTargetPort !== p) {
-          console.log(`[Auto-Discovery] 🎯 Verified active Antigravity backend on port: ${p}`);
           cachedTargetPort = p;
+          console.log(`[Auto-Discovery] 🎯 Verified active Antigravity backend on port: ${p}`);
         }
         return p;
       }
@@ -760,18 +192,23 @@ async function probeAndFindPort() {
   return null;
 }
 
+let cachedTargetPort = null;
+let isDiscovering = false;
+let lastRequestTime = Date.now();
+
 setInterval(async () => {
+  if (Date.now() - lastRequestTime > 120000 && cachedTargetPort) {
+    return;
+  }
+
   if (isDiscovering) return;
   isDiscovering = true;
   try {
     if (cachedTargetPort) {
-      if (Date.now() - lastRequestTime > 10000) {
-        const stillAlive = await testPort(cachedTargetPort);
-        if (!stillAlive) {
-          console.log(`[Auto-Discovery] ⚠️ Port ${cachedTargetPort} became unreachable, searching for new port...`);
-          cachedTargetPort = null;
-          await probeAndFindPort();
-        }
+      const stillAlive = await testPort(cachedTargetPort);
+      if (!stillAlive) {
+        cachedTargetPort = null;
+        await probeAndFindPort();
       }
     } else {
       await probeAndFindPort();
@@ -882,83 +319,9 @@ function prepareUpstreamHeaders(incomingHeaders, targetPort) {
   return headers;
 }
 
-const INJECTED_DRAWER_SNIPPET = `
-<!-- 🌿 Antigravity Git Drawer -->
-<div id="__ag_git_fab" style="position:fixed;bottom:18px;right:18px;z-index:999999;font-family:-apple-system,BlinkMacSystemFont,sans-serif;">
-  <button onclick="window.__toggleAgGit()" style="background:#007acc;color:#fff;border:none;padding:8px 16px;border-radius:20px;font-size:13px;font-weight:600;box-shadow:0 4px 14px rgba(0,0,0,0.5);cursor:pointer;display:flex;align-items:center;gap:6px;">
-    🌿 Git Inspector
-  </button>
-</div>
-<div id="__ag_git_overlay" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.6);backdrop-filter:blur(3px);z-index:9999998;" onclick="window.__toggleAgGit()"></div>
-<div id="__ag_git_drawer" style="position:fixed;top:0;right:-100vw;width:min(1150px, 95vw);height:100vh;background:#181818;box-shadow:-8px 0 30px rgba(0,0,0,0.8);z-index:9999999;transition:right 0.25s ease;display:flex;flex-direction:column;">
-  <!-- Left resize drag handle -->
-  <div id="__ag_git_resizer" style="position:absolute;top:0;left:0;width:10px;height:100%;cursor:col-resize;user-select:none;z-index:10000000;background:transparent;" title="Drag to resize width"></div>
-  
-  <div style="padding:8px 16px;background:#252526;border-bottom:1px solid #2d2d2d;display:flex;justify-content:space-between;align-items:center;">
-    <div style="display:flex;align-items:center;gap:12px;">
-      <span style="font-weight:600;color:#ffffff;font-size:13px;">🌿 Git Live Inspector</span>
-      <button onclick="window.__toggleFullscreenGit()" id="__ag_git_expand_btn" style="background:#333333;color:#cccccc;border:none;padding:3px 8px;border-radius:3px;font-size:11px;cursor:pointer;" title="Toggle Fullscreen">⛶ Fullscreen</button>
-    </div>
-    <button onclick="window.__toggleAgGit()" style="background:transparent;border:none;color:#858585;font-size:18px;cursor:pointer;padding:0 6px;">✕</button>
-  </div>
-  <iframe src="/__git" style="flex:1;border:none;width:100%;height:100%;"></iframe>
-</div>
-<script>
-  (function() {
-    var drawer = document.getElementById('__ag_git_drawer');
-    var overlay = document.getElementById('__ag_git_overlay');
-    var resizer = document.getElementById('__ag_git_resizer');
-    var isExpanded = false;
-    var defaultWidth = Math.min(1150, window.innerWidth * 0.95) + 'px';
-
-    window.__toggleAgGit = function() {
-      if (drawer.style.right === '0px') {
-        drawer.style.right = '-100vw';
-        overlay.style.display = 'none';
-      } else {
-        drawer.style.right = '0px';
-        overlay.style.display = 'block';
-      }
-    };
-
-    window.__toggleFullscreenGit = function() {
-      var btn = document.getElementById('__ag_git_expand_btn');
-      if (!isExpanded) {
-        drawer.style.width = '100vw';
-        btn.textContent = '⤢ Restore';
-        isExpanded = true;
-      } else {
-        drawer.style.width = defaultWidth;
-        btn.textContent = '⛶ Fullscreen';
-        isExpanded = false;
-      }
-    };
-
-    var isDragging = false;
-    resizer.addEventListener('mousedown', function(e) {
-      isDragging = true;
-      document.body.style.userSelect = 'none';
-      e.preventDefault();
-    });
-
-    window.addEventListener('mousemove', function(e) {
-      if (!isDragging) return;
-      var newWidth = window.innerWidth - e.clientX;
-      if (newWidth >= 450 && newWidth <= window.innerWidth) {
-        drawer.style.width = newWidth + 'px';
-      }
-    });
-
-    window.addEventListener('mouseup', function() {
-      if (isDragging) {
-        isDragging = false;
-        document.body.style.userSelect = '';
-      }
-    });
-  })();
-</script>
-`;
-
+// -------------------------------------------------------------
+// 5. HTTP Proxy & Request Router
+// -------------------------------------------------------------
 async function handleAuthAndProxy(req, res) {
   lastRequestTime = Date.now();
 
@@ -1016,43 +379,30 @@ async function handleAuthAndProxy(req, res) {
     `);
   }
 
-  if (req.socket) {
-    req.socket.setTimeout(0);
-    req.socket.setNoDelay(true);
-    req.socket.setKeepAlive(true, 1000);
-  }
+  const headers = prepareUpstreamHeaders(req.headers, currentTargetPort);
+  let proxyResEnded = false;
 
-  const reqOptions = {
+  const proxyReq = https.request({
     hostname: TARGET_HOST,
     port: currentTargetPort,
     path: req.url,
     method: req.method,
-    headers: prepareUpstreamHeaders(req.headers, currentTargetPort),
+    headers: headers,
     agent: agent,
-  };
-
-  let proxyResEnded = false;
-
-  const proxyReq = https.request(reqOptions, (proxyRes) => {
-    if (proxyRes.socket) {
-      proxyRes.socket.setTimeout(0);
-      proxyRes.socket.setNoDelay(true);
-      proxyRes.socket.setKeepAlive(true, 1000);
-    }
-
+    rejectUnauthorized: false,
+    timeout: 0
+  }, (proxyRes) => {
     const respHeaders = { ...proxyRes.headers };
-    for (const k of Object.keys(respHeaders)) {
-      if (k.startsWith(':')) {
-        delete respHeaders[k];
-      }
-    }
+    delete respHeaders['transfer-encoding'];
 
     const contentType = proxyRes.headers['content-type'] || '';
     const isHtml = contentType.includes('text/html');
 
-    if (isHtml) {
+    if (isHtml && proxyRes.statusCode === 200) {
       delete respHeaders['content-length'];
       delete respHeaders['content-encoding'];
+      delete respHeaders['accept-ranges'];
+
       res.writeHead(proxyRes.statusCode, respHeaders);
 
       const chunks = [];
@@ -1073,10 +423,11 @@ async function handleAuthAndProxy(req, res) {
         } catch (e) {}
 
         let body = buffer.toString('utf8');
+        const drawerSnippet = getInjectedDrawerSnippet();
         if (body.includes('</body>')) {
-          body = body.replace('</body>', `${INJECTED_DRAWER_SNIPPET}</body>`);
+          body = body.replace('</body>', `${drawerSnippet}</body>`);
         } else {
-          body += INJECTED_DRAWER_SNIPPET;
+          body += drawerSnippet;
         }
         res.end(body);
       });
@@ -1190,6 +541,9 @@ server.on('upgrade', async (req, socket, head) => {
     cleanup();
   });
 });
+
+let tunnelProcess = null;
+let quickTunnelUrl = null;
 
 function launchCloudflareTunnel() {
   if (CUSTOM_DOMAIN) {
@@ -1316,6 +670,10 @@ if (require.main === module) {
 module.exports = {
   findGitRepos,
   executeGit,
+  decodeGitOctalOnly,
+  handleGitApi,
+  renderGitUi,
+  getInjectedDrawerSnippet,
   prepareUpstreamHeaders,
   parseCookies,
   isAuthenticated,
