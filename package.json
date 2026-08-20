@@ -1,0 +1,20 @@
+{
+  "name": "antigravity-remote",
+  "version": "1.0.0",
+  "description": "High-throughput remote access gateway for Google Antigravity with Cloudflare Tunnels, password protection, and built-in visual Git Inspector",
+  "main": "index.js",
+  "bin": {
+    "antigravity-remote": "./index.js"
+  },
+  "keywords": [
+    "antigravity",
+    "google-antigravity",
+    "agentic-ai",
+    "remote-access",
+    "cloudflare-tunnel",
+    "git-diff",
+    "proxy"
+  ],
+  "author": "Artem Barinov",
+  "license": "MIT"
+}
